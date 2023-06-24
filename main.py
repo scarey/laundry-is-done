@@ -4,33 +4,38 @@
 
 # Micropython code for sensing when the washer/dryer is finished.
 
+import _thread
+import json
+import sys
 import time
 
-from machine import SoftI2C, Pin
 import uasyncio as asyncio
+from machine import SoftI2C, Pin
+
 import mpu6050
+import mqtt_local
 from mqtt_as import MQTTClient
-from mqtt_local import config
-import _thread
 
 # motion is indicated by the 3 accelerometer readings combined being greater than this threshold
-sensitivity = 150
+sensitivity = 110
 idle_counter = 0
 
 # done means no motion within SAMPLE_SECS * MAX_IDLE_PERIODS seconds
-SAMPLE_SECS = 10
-MAX_IDLE_PERIODS = 6
+sample_secs = 10
+max_idle_periods = 6
 
 client = None
 command = None
 
 BASE_TOPIC = 'esp32/washer'
 DEVICE_STATUS_TOPIC = f'{BASE_TOPIC}/status'
+CONFIG_TOPIC = f'{BASE_TOPIC}/config'
 ACTIVE_TOPIC = f'{BASE_TOPIC}/active/1'
 READINGS_TOPIC = f'{BASE_TOPIC}/readings/1'
 NOTIFY_TOPIC = f'{BASE_TOPIC}/notify'
 COMMAND_TOPIC = f'{ACTIVE_TOPIC}/set'
 
+config_done = False
 is_active = False
 accelerometer_changes = None
 notification = None
@@ -57,18 +62,36 @@ def update_readings_thread():
                 idle_counter = 0
             else:
                 idle_counter += 1
-            if idle_counter == MAX_IDLE_PERIODS:
+            if idle_counter >= max_idle_periods:
                 print("Done!")
                 command = 'off'
                 notification = "We're done!"
 
-        time.sleep(SAMPLE_SECS)
+        time.sleep(sample_secs)
 
 
 def handle_incoming_message(topic, msg, retained):
-    print(f'{topic}: {msg}')
-    global command
-    command = str(msg, 'UTF-8')
+    msg_string = str(msg, 'UTF-8')
+    topic_string = str(topic, 'UTF-8')
+    print(f'{topic_string}: {msg_string}')
+    if topic_string == CONFIG_TOPIC:
+        if not retained:
+            print("WARNING: config should be published with retain true!")
+        global config_done, sample_secs, max_idle_periods, sensitivity
+        try:
+            config = json.loads(msg_string)
+            sample_secs = config.get('sampleSecs', sample_secs)
+            max_idle_periods = config.get('maxIdlePeriods', max_idle_periods)
+            sensitivity = config.get('sensitivity', sensitivity)
+            print(
+                f'Configured with sampleSecs: {sample_secs}, maxIdlePeriods: {max_idle_periods}, sensitivity: {sensitivity}')
+            config_done = True
+        except Exception as e:
+            print(f'Problem with config: {e}')
+            sys.print_exception(e)
+    else:
+        global command
+        command = msg_string
 
 
 async def wifi_han(state):
@@ -79,6 +102,7 @@ async def wifi_han(state):
 # If you connect with clean_session True, must re-subscribe (MQTT spec 3.1.2.4)
 async def conn_han(client):
     await client.subscribe(COMMAND_TOPIC, 0)
+    await client.subscribe(CONFIG_TOPIC, 0)
     await online()
 
 
@@ -92,6 +116,10 @@ async def main():
     await online()
     global command, is_active, accelerometer_changes, idle_counter, notification
     while True:
+        while not config_done:
+            print("Config not found, will check again in a few secs...")
+            await asyncio.sleep(5)
+
         if command:
             is_active = True if command.lower() == 'on' else False
             if is_active:
@@ -108,13 +136,13 @@ async def main():
         await asyncio.sleep(1)
 
 
-config['subs_cb'] = handle_incoming_message
-config['connect_coro'] = conn_han
-config['wifi_coro'] = wifi_han
-config['will'] = [DEVICE_STATUS_TOPIC, 'offline', True, 0]
+mqtt_local.config['subs_cb'] = handle_incoming_message
+mqtt_local.config['connect_coro'] = conn_han
+mqtt_local.config['wifi_coro'] = wifi_han
+mqtt_local.config['will'] = [DEVICE_STATUS_TOPIC, 'offline', True, 0]
 
 MQTTClient.DEBUG = False
-client = MQTTClient(config)
+client = MQTTClient(mqtt_local.config)
 
 try:
     _thread.start_new_thread(update_readings_thread, ())
